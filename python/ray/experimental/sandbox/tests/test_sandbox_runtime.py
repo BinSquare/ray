@@ -10,7 +10,13 @@ import time
 
 import pytest
 
-from ray.experimental.sandbox.backend.base import ExecResult, SandboxStatus
+from ray.experimental.sandbox import runtime as runtime_mod
+from ray.experimental.sandbox.backend.base import (
+    BaseSandboxBackend,
+    ExecResult,
+    SandboxStatus,
+)
+from ray.experimental.sandbox.backend.gvisor import GVisorSandboxBackend
 from ray.experimental.sandbox.runtime import SandboxRuntime
 
 
@@ -110,6 +116,68 @@ def test_no_ttl_by_default():
     (config,) = runtime._backend.configs
     assert config.ttl_seconds is None
     assert config.shell == "/bin/bash"
+
+
+class _PluginBackend(_FakeBackend, BaseSandboxBackend):
+    """A backend as a third-party package would ship it."""
+
+    def __init__(self, image_manager=None):
+        _FakeBackend.__init__(self)
+        BaseSandboxBackend.__init__(self, image_manager or _FakeImageManager())
+
+
+class _EntryPoint:
+    def __init__(self, name, target):
+        self.name, self._target = name, target
+
+    def load(self):
+        return self._target
+
+
+def _register(monkeypatch, **backends):
+    import importlib.metadata
+
+    def entry_points(group=None):
+        assert group == runtime_mod.BACKEND_ENTRY_POINT_GROUP
+        return [_EntryPoint(name, cls) for name, cls in backends.items()]
+
+    monkeypatch.setattr(importlib.metadata, "entry_points", entry_points)
+
+
+def test_gvisor_is_the_default_backend(monkeypatch):
+    monkeypatch.delenv(runtime_mod.BACKEND_ENV_VAR, raising=False)
+    runtime = SandboxRuntime()
+    assert isinstance(runtime.backend, GVisorSandboxBackend)
+    assert runtime.image_manager is runtime.backend.image_manager
+
+
+def test_explicit_backend_and_its_image_manager_are_used():
+    backend = _PluginBackend()
+    runtime = SandboxRuntime(backend=backend)
+    assert runtime.backend is backend
+    assert runtime.image_manager is backend.image_manager
+    assert runtime.create(image="python:3.12-slim") == "ray-sandbox-fake0001"
+    assert backend.configs[0].image == "python:3.12-slim"
+
+
+def test_env_var_selects_a_registered_backend(monkeypatch):
+    _register(monkeypatch, plugin=_PluginBackend)
+    monkeypatch.setenv(runtime_mod.BACKEND_ENV_VAR, "plugin")
+    assert isinstance(SandboxRuntime().backend, _PluginBackend)
+
+
+def test_unknown_backend_lists_the_installed_ones(monkeypatch):
+    _register(monkeypatch, plugin=_PluginBackend)
+    monkeypatch.setenv(runtime_mod.BACKEND_ENV_VAR, "nope")
+    with pytest.raises(ValueError, match=r"'nope'.*\['gvisor', 'plugin'\]"):
+        SandboxRuntime()
+
+
+def test_registered_object_must_be_a_backend(monkeypatch):
+    _register(monkeypatch, broken=_FakeBackend)
+    monkeypatch.setenv(runtime_mod.BACKEND_ENV_VAR, "broken")
+    with pytest.raises(TypeError, match="not a BaseSandboxBackend"):
+        SandboxRuntime()
 
 
 if __name__ == "__main__":

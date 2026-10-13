@@ -4,31 +4,73 @@ import threading
 from typing import Callable, Dict, List, Optional, Union
 
 from ray.experimental.sandbox.backend.base import (
+    BaseSandboxBackend,
     ExecResult,
     SandboxStatus,
 )
 from ray.experimental.sandbox.backend.gvisor import GVisorSandboxBackend
 from ray.experimental.sandbox.config import SandboxConfig
-from ray.experimental.sandbox.image_manager import ImageManager
+from ray.experimental.sandbox.image_manager import BaseImageManager
 from ray.util.annotations import PublicAPI
+
+# Selects the backend for runtimes built without an explicit one. Set it in a
+# job's runtime_env env_vars to choose the backend cluster-wide.
+BACKEND_ENV_VAR = "RAY_SANDBOX_BACKEND"
+# Packages register backends under this entry point group: name -> class.
+BACKEND_ENTRY_POINT_GROUP = "ray.sandbox_backends"
+DEFAULT_BACKEND = "gvisor"
+
+
+def load_backend(name: Optional[str] = None) -> BaseSandboxBackend:
+    """Construct the sandbox backend registered under ``name``.
+
+    ``name`` defaults to ``$RAY_SANDBOX_BACKEND``, then ``"gvisor"``. Names
+    other than ``"gvisor"`` resolve through the ``ray.sandbox_backends`` entry
+    point group, so an installed package can provide a backend without Ray
+    knowing about it.
+    """
+    name = name or os.environ.get(BACKEND_ENV_VAR) or DEFAULT_BACKEND
+    if name == DEFAULT_BACKEND:
+        return GVisorSandboxBackend()
+    from importlib.metadata import entry_points
+
+    found = {ep.name: ep for ep in entry_points(group=BACKEND_ENTRY_POINT_GROUP)}
+    if name not in found:
+        known = sorted({DEFAULT_BACKEND, *found})
+        raise ValueError(
+            f"Unknown sandbox backend {name!r}; installed backends: {known}."
+        )
+    backend_cls = found[name].load()
+    backend = backend_cls()
+    if not isinstance(backend, BaseSandboxBackend):
+        raise TypeError(
+            f"Sandbox backend {name!r} ({backend_cls!r}) is not a BaseSandboxBackend."
+        )
+    return backend
 
 
 @PublicAPI(stability="alpha")
 class SandboxRuntime:
-    """Low-level interface for managing local sandbox runtime environments."""
+    """Low-level interface for managing local sandbox runtime environments.
 
-    def __init__(self):
-        self._image_manager = ImageManager()
-        self._backend = GVisorSandboxBackend(image_manager=self._image_manager)
+    Args:
+        backend: The backend that runs the sandboxes. Defaults to
+            ``load_backend()``: ``$RAY_SANDBOX_BACKEND`` or gVisor.
+    """
+
+    def __init__(self, backend: Optional[BaseSandboxBackend] = None):
+        self._backend = backend if backend is not None else load_backend()
+        # A backend may bring its own images (or none to pull): use its manager.
+        self._image_manager = self._backend.image_manager
         self._ttl_timers: Dict[str, threading.Timer] = {}
 
     @property
-    def image_manager(self) -> ImageManager:
+    def image_manager(self) -> BaseImageManager:
         """The ImageManager instance used by this runtime."""
         return self._image_manager
 
     @property
-    def backend(self) -> GVisorSandboxBackend:
+    def backend(self) -> BaseSandboxBackend:
         """The backend instance used by this runtime."""
         return self._backend
 
